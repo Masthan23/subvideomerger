@@ -22,6 +22,15 @@ def init_state():
         st.session_state.eps = []
     if "save_path" not in st.session_state:
         st.session_state.save_path = "/tmp/merged_videos"
+    # Store raw bytes separately so they survive reruns
+    if "ep_video_bytes" not in st.session_state:
+        st.session_state.ep_video_bytes = {}
+    if "ep_video_names" not in st.session_state:
+        st.session_state.ep_video_names = {}
+    if "ep_srt_bytes" not in st.session_state:
+        st.session_state.ep_srt_bytes = {}
+    if "ep_srt_names" not in st.session_state:
+        st.session_state.ep_srt_names = {}
     clean = []
     for ep in st.session_state.eps:
         if ep is None:
@@ -29,8 +38,6 @@ def init_state():
         if not isinstance(ep, dict):
             continue
         ep.setdefault("name", "")
-        ep.setdefault("video", None)
-        ep.setdefault("srt", None)
         ep.setdefault("job", None)
         clean.append(ep)
     st.session_state.eps = clean
@@ -144,18 +151,11 @@ def check_ffmpeg():
 
 @st.cache_data(ttl=300)
 def check_hw_accel():
-    hw = {
-        "nvenc": False,
-        "qsv": False,
-        "videotoolbox": False,
-        "vaapi": False
-    }
+    hw = {"nvenc": False, "qsv": False, "videotoolbox": False, "vaapi": False}
     try:
         r = subprocess.run(
             ["ffmpeg", "-encoders"],
-            capture_output=True,
-            text=True,
-            timeout=10
+            capture_output=True, text=True, timeout=10
         )
         out = r.stdout
         if "h264_nvenc" in out:
@@ -199,31 +199,11 @@ def format_file_size(size_bytes):
     return str(round(size_bytes / 1024 ** 3, 2)) + " GB"
 
 
-def get_uploaded_file_size(f):
-    try:
-        pos = f.tell()
-        f.seek(0, 2)
-        s = f.tell()
-        f.seek(pos)
-        return s
-    except Exception:
-        try:
-            return f.size
-        except Exception:
-            return 0
-
-
-def save_uploaded_file_chunked(uploaded_file, dest_path, chunk_size=64 * 1024 * 1024):
-    uploaded_file.seek(0)
-    total = 0
-    with open(dest_path, "wb") as out:
-        while True:
-            chunk = uploaded_file.read(chunk_size)
-            if not chunk:
-                break
-            out.write(chunk)
-            total += len(chunk)
-    return total
+def save_bytes_to_file(data_bytes, dest_path):
+    """Save bytes directly to file."""
+    with open(dest_path, "wb") as f:
+        f.write(data_bytes)
+    return len(data_bytes)
 
 
 def unique_dest(folder, filename):
@@ -235,7 +215,9 @@ def unique_dest(folder, filename):
 
 
 def good(result, out_path):
-    if not result or result.returncode != 0:
+    if result is None:
+        return False
+    if result.returncode != 0:
         return False
     if not os.path.exists(out_path):
         return False
@@ -258,8 +240,7 @@ def parse_srt(path):
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
     content = content.replace("\ufeff", "")
-    content = content.replace("\r\n", "\n")
-    content = content.replace("\r", "\n")
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
     entries = []
     for block in re.split(r"\n\s*\n", content.strip()):
         lines = block.strip().split("\n")
@@ -295,12 +276,7 @@ def fmt_srt_time(s):
     m = int((s % 3600) // 60)
     sc = int(s % 60)
     ms = int((s % 1) * 1000)
-    return (
-        str(h).zfill(2) + ":"
-        + str(m).zfill(2) + ":"
-        + str(sc).zfill(2) + ","
-        + str(ms).zfill(3)
-    )
+    return f"{h:02d}:{m:02d}:{sc:02d},{ms:03d}"
 
 
 def fmt_ass_time(s):
@@ -308,12 +284,7 @@ def fmt_ass_time(s):
     m = int((s % 3600) // 60)
     sc = int(s % 60)
     cs = int((s % 1) * 100)
-    return (
-        str(h) + ":"
-        + str(m).zfill(2) + ":"
-        + str(sc).zfill(2) + "."
-        + str(cs).zfill(2)
-    )
+    return f"{h}:{m:02d}:{sc:02d}.{cs:02d}"
 
 
 def clean_srt(src, dst):
@@ -328,14 +299,16 @@ def clean_srt(src, dst):
 
 def create_ass(srt_path, ass_path, w=1920, h=1080):
     entries = parse_srt(srt_path)
+    if not entries:
+        return 0
     fs = max(int(h * 0.045), 24)
     mv = int(h * 0.06)
     mlr = int(w * 0.05)
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        "PlayResX: " + str(w) + "\n"
-        "PlayResY: " + str(h) + "\n"
+        f"PlayResX: {w}\n"
+        f"PlayResY: {h}\n"
         "WrapStyle: 0\n"
         "ScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
@@ -343,10 +316,9 @@ def create_ass(srt_path, ass_path, w=1920, h=1080):
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Default,Arial," + str(fs) + ","
+        f"Style: Default,Arial,{fs},"
         "&H00FFFFFF,&H000000FF,&H00000000,&H96000000,"
-        "0,0,0,0,100,100,0,0,1,2,1,2,"
-        + str(mlr) + "," + str(mlr) + "," + str(mv) + ",1\n\n"
+        f"0,0,0,0,100,100,0,0,1,2,1,2,{mlr},{mlr},{mv},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, "
         "MarginL, MarginR, MarginV, Effect, Text\n"
@@ -355,10 +327,8 @@ def create_ass(srt_path, ass_path, w=1920, h=1080):
     for e in entries:
         txt = e["text"].replace("\n", "\\N").replace("{", "").replace("}", "")
         lines.append(
-            "Dialogue: 0,"
-            + fmt_ass_time(e["start"]) + ","
-            + fmt_ass_time(e["end"])
-            + ",Default,,0,0,0,," + txt + "\n"
+            f"Dialogue: 0,{fmt_ass_time(e['start'])},{fmt_ass_time(e['end'])}"
+            f",Default,,0,0,0,,{txt}\n"
         )
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(header)
@@ -371,9 +341,7 @@ def get_video_info(path):
         r = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
              "-show_streams", "-show_format", path],
-            capture_output=True,
-            text=True,
-            timeout=30
+            capture_output=True, text=True, timeout=30
         )
         if r.returncode == 0:
             data = json.loads(r.stdout)
@@ -391,13 +359,6 @@ def get_video_info(path):
     return {"width": 1920, "height": 1080, "duration": 0}
 
 
-def escape_path(p):
-    p = p.replace("\\", "/")
-    if len(p) >= 2 and p[1] == ":":
-        p = p[0] + "\\:" + p[2:]
-    return p.replace("'", "\\'")
-
-
 def safe_get_job(ep):
     if not isinstance(ep, dict):
         return {}
@@ -407,10 +368,59 @@ def safe_get_job(ep):
     return j
 
 
-def process_episode(
-    video_file, video_name, srt_file, srt_name,
-    ep_name, merge_type, dl_folder, progress_cb=None
+def run_ffmpeg_with_progress(cmd, duration, progress_cb, start_pct=15, end_pct=90):
+    """Run ffmpeg and report progress. Returns subprocess result-like object."""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+        stderr_lines = []
+        for line in proc.stderr:
+            stderr_lines.append(line)
+            if duration and duration > 0:
+                m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
+                if m:
+                    elapsed = (
+                        int(m.group(1)) * 3600
+                        + int(m.group(2)) * 60
+                        + float(m.group(3))
+                    )
+                    ratio = min(elapsed / duration, 1.0)
+                    pct = int(start_pct + ratio * (end_pct - start_pct))
+                    pct_display = int(ratio * 100)
+                    if progress_cb:
+                        progress_cb(pct, f"Encoding... {pct_display}%")
+
+        proc.wait(timeout=86400)
+
+        class Result:
+            returncode = proc.returncode
+            stderr = "".join(stderr_lines)
+            stdout = ""
+
+        return Result()
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return None
+    except Exception as ex:
+        print(f"[run_ffmpeg_with_progress] {ex}")
+        return None
+
+
+def process_episode_from_bytes(
+    video_bytes, video_name,
+    srt_bytes, srt_name,
+    ep_name, merge_type, dl_folder,
+    progress_cb=None
 ):
+    """Process episode using raw bytes - survives Streamlit reruns."""
     work_dir = None
     out_file = None
 
@@ -428,142 +438,194 @@ def process_episode(
         v_ext = Path(video_name).suffix.lower() or ".mp4"
         s_ext = Path(srt_name).suffix.lower() or ".srt"
         v_path = os.path.join(work_dir, "video" + v_ext)
-        s_path = os.path.join(work_dir, "srt" + s_ext)
+        s_path = os.path.join(work_dir, "subtitle" + s_ext)
 
         upd(2, "Writing video to disk...")
-        v_size = save_uploaded_file_chunked(video_file, v_path)
-        upd(5, "Video written: " + format_file_size(v_size))
+        save_bytes_to_file(video_bytes, v_path)
+        upd(5, f"Video written: {format_file_size(len(video_bytes))}")
 
         upd(6, "Writing subtitle...")
-        save_uploaded_file_chunked(srt_file, s_path)
+        save_bytes_to_file(srt_bytes, s_path)
 
-        if os.path.getsize(v_path) < 1000:
-            raise ValueError("Video file too small — upload may have failed")
-        if os.path.getsize(s_path) < 5:
-            raise ValueError("Subtitle file too small")
+        # Validate files
+        v_size = os.path.getsize(v_path)
+        s_size = os.path.getsize(s_path)
 
+        if v_size < 1000:
+            raise ValueError(f"Video file too small ({v_size} bytes) — upload may have failed")
+        if s_size < 5:
+            raise ValueError(f"Subtitle file too small ({s_size} bytes)")
+
+        upd(7, f"Parsing subtitles...")
         entries = parse_srt(s_path)
         if not entries:
-            raise ValueError("No subtitle entries found in SRT file")
-        upd(8, "Parsed " + str(len(entries)) + " subtitle entries")
+            raise ValueError("No subtitle entries found in SRT file. Check file format.")
+        upd(8, f"Parsed {len(entries)} subtitle entries")
 
+        # Get video properties
+        upd(9, "Probing video...")
         info = get_video_info(v_path)
-        sub_ext = Path(s_path).suffix.lower()
-        safe = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", ep_name)
+        upd(10, f"Video: {info['width']}x{info['height']}, {info['duration']:.1f}s")
+
+        # Sanitize output name
+        safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", ep_name)
         safe = re.sub(r"_+", "_", safe).strip("_") or "episode"
 
         encoder, enc_args = get_best_encoder()
         os.makedirs(dl_folder, exist_ok=True)
 
-        def run_ff_prog(cmd):
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1
-                )
-                dur = info["duration"]
-                stderr_lines = []
-                for line in proc.stderr:
-                    stderr_lines.append(line)
-                    m = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
-                    if m and dur > 0:
-                        el = (
-                            int(m.group(1)) * 3600
-                            + int(m.group(2)) * 60
-                            + float(m.group(3))
-                        )
-                        pct = int(15 + min(el / dur, 1.0) * 75)
-                        upd(pct, "Encoding... " + str(int(min(el / dur, 1.0) * 100)) + "%")
-                proc.wait(timeout=86400)
-
-                class R:
-                    returncode = proc.returncode
-                    stderr = "".join(stderr_lines)
-                    stdout = ""
-
-                return R()
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                return None
-            except Exception as ex:
-                print("[run_ff_prog] " + str(ex))
-                return None
-
         if merge_type == "hard":
             out_file = unique_dest(dl_folder, safe + ".mp4")
-            upd(10, "Encoding with " + encoder + "...")
+            upd(11, f"Hard sub — encoder: {encoder}")
             success = False
             last_err = ""
 
+            # Method 1: ASS subtitle burn-in
             try:
-                ass = os.path.join(work_dir, "styled.ass")
-                if create_ass(s_path, ass, info["width"], info["height"]) > 0:
-                    ae = escape_path(os.path.abspath(ass))
+                ass_path = os.path.join(work_dir, "styled.ass")
+                n_entries = create_ass(s_path, ass_path, info["width"], info["height"])
+
+                if n_entries > 0 and os.path.exists(ass_path):
+                    upd(12, "Using ASS subtitle burn-in...")
+                    # Use absolute path with proper escaping for Linux
+                    ass_abs = os.path.abspath(ass_path)
+                    # Escape colons and backslashes for ffmpeg filter
+                    ass_escaped = ass_abs.replace("\\", "\\\\").replace(":", "\\:")
+
                     cmd = (
-                        ["ffmpeg", "-y", "-i", os.path.abspath(v_path),
-                         "-vf", "ass='" + ae + "'",
+                        ["ffmpeg", "-y",
+                         "-i", os.path.abspath(v_path),
+                         "-vf", f"ass={ass_escaped}",
                          "-c:v", encoder]
                         + enc_args
-                        + ["-c:a", "copy", "-movflags", "+faststart",
+                        + ["-c:a", "copy",
+                           "-movflags", "+faststart",
                            os.path.abspath(out_file)]
                     )
-                    r = run_ff_prog(cmd)
+                    upd(13, "Running FFmpeg (ASS method)...")
+                    r = run_ffmpeg_with_progress(
+                        cmd, info["duration"], upd, start_pct=15, end_pct=88
+                    )
                     if good(r, out_file):
                         success = True
+                        upd(90, "ASS burn-in complete!")
                     else:
-                        last_err = r.stderr[-300:] if r and r.stderr else "ASS burn failed"
+                        err_detail = ""
+                        if r and r.stderr:
+                            # Get last meaningful error lines
+                            err_lines = [l for l in r.stderr.splitlines() if l.strip()]
+                            err_detail = "\n".join(err_lines[-5:])
+                        last_err = f"ASS method failed: {err_detail}"
                         if os.path.exists(out_file):
                             os.remove(out_file)
             except Exception as ex:
-                last_err = str(ex)
+                last_err = f"ASS method exception: {ex}"
                 if out_file and os.path.exists(out_file):
-                    os.remove(out_file)
+                    try:
+                        os.remove(out_file)
+                    except Exception:
+                        pass
 
+            # Method 2: subtitles filter with cleaned SRT
             if not success:
                 try:
-                    su = s_path
-                    if sub_ext == ".srt":
-                        cs = os.path.join(work_dir, "clean.srt")
-                        clean_srt(s_path, cs)
-                        su = cs
-                    se = escape_path(os.path.abspath(su))
-                    if sub_ext in (".ass", ".ssa"):
-                        vf = "ass='" + se + "'"
-                    else:
-                        vf = "subtitles='" + se + "'"
+                    upd(14, "Trying subtitles filter method...")
+                    cs_path = os.path.join(work_dir, "clean.srt")
+                    clean_srt(s_path, cs_path)
+
+                    cs_abs = os.path.abspath(cs_path)
+                    cs_escaped = cs_abs.replace("\\", "\\\\").replace(":", "\\:")
+
                     cmd = (
-                        ["ffmpeg", "-y", "-i", os.path.abspath(v_path),
-                         "-vf", vf, "-c:v", encoder]
+                        ["ffmpeg", "-y",
+                         "-i", os.path.abspath(v_path),
+                         "-vf", f"subtitles={cs_escaped}",
+                         "-c:v", encoder]
                         + enc_args
-                        + ["-c:a", "copy", "-movflags", "+faststart",
+                        + ["-c:a", "copy",
+                           "-movflags", "+faststart",
                            os.path.abspath(out_file)]
                     )
-                    r = run_ff_prog(cmd)
+                    upd(15, "Running FFmpeg (subtitles filter)...")
+                    r = run_ffmpeg_with_progress(
+                        cmd, info["duration"], upd, start_pct=16, end_pct=88
+                    )
                     if good(r, out_file):
                         success = True
+                        upd(90, "Subtitles filter complete!")
                     else:
-                        last_err = r.stderr[-300:] if r and r.stderr else "filter failed"
+                        err_detail = ""
+                        if r and r.stderr:
+                            err_lines = [l for l in r.stderr.splitlines() if l.strip()]
+                            err_detail = "\n".join(err_lines[-5:])
+                        last_err = f"subtitles filter failed: {err_detail}"
                         if os.path.exists(out_file):
                             os.remove(out_file)
                 except Exception as ex:
-                    last_err = str(ex)
+                    last_err = f"subtitles filter exception: {ex}"
                     if out_file and os.path.exists(out_file):
-                        os.remove(out_file)
+                        try:
+                            os.remove(out_file)
+                        except Exception:
+                            pass
+
+            # Method 3: Embed subtitle as soft track then burn (fallback)
+            if not success:
+                try:
+                    upd(20, "Trying fallback re-encode method...")
+                    cs_path = os.path.join(work_dir, "fallback.srt")
+                    clean_srt(s_path, cs_path)
+
+                    # Copy subtitle file to simple path to avoid escaping issues
+                    simple_srt = os.path.join(work_dir, "sub.srt")
+                    shutil.copy2(cs_path, simple_srt)
+
+                    cmd = (
+                        ["ffmpeg", "-y",
+                         "-i", os.path.abspath(v_path),
+                         "-vf", f"subtitles='{simple_srt}'",
+                         "-c:v", encoder]
+                        + enc_args
+                        + ["-c:a", "copy",
+                           "-movflags", "+faststart",
+                           os.path.abspath(out_file)]
+                    )
+                    r = run_ffmpeg_with_progress(
+                        cmd, info["duration"], upd, start_pct=22, end_pct=88
+                    )
+                    if good(r, out_file):
+                        success = True
+                        upd(90, "Fallback method complete!")
+                    else:
+                        err_detail = ""
+                        if r and r.stderr:
+                            err_lines = [l for l in r.stderr.splitlines() if l.strip()]
+                            err_detail = "\n".join(err_lines[-5:])
+                        last_err = f"Fallback failed: {err_detail}"
+                        if os.path.exists(out_file):
+                            os.remove(out_file)
+                except Exception as ex:
+                    last_err = f"Fallback exception: {ex}"
+                    if out_file and os.path.exists(out_file):
+                        try:
+                            os.remove(out_file)
+                        except Exception:
+                            pass
 
             if not success:
-                raise RuntimeError("All hard-sub methods failed: " + last_err[:300])
+                raise RuntimeError(
+                    f"All hard-sub methods failed.\nLast error: {last_err[:500]}"
+                )
 
-        else:
+        else:  # soft sub
             success = False
             last_err = ""
-            upd(15, "Soft sub — stream copy...")
+            upd(15, "Soft sub — attempting stream copy...")
 
+            # Method 1: MKV with subtitle stream
             out_mkv = unique_dest(dl_folder, safe + ".mkv")
             try:
-                sub_codec = "ass" if sub_ext in (".ass", ".ssa") else "srt"
+                sub_codec = "ass" if s_ext in (".ass", ".ssa") else "srt"
                 r = subprocess.run(
                     ["ffmpeg", "-y",
                      "-i", os.path.abspath(v_path),
@@ -573,64 +635,66 @@ def process_episode(
                      "-metadata:s:s:0", "language=eng",
                      "-disposition:s:0", "default",
                      out_mkv],
-                    capture_output=True,
-                    text=True,
-                    timeout=86400
+                    capture_output=True, text=True, timeout=86400
                 )
                 if good(r, out_mkv):
                     out_file = out_mkv
                     success = True
-                    upd(90, "Stream copy done...")
+                    upd(90, "MKV stream copy done!")
                 else:
-                    last_err = r.stderr[-300:] if r.stderr else "mkv failed"
+                    last_err = r.stderr[-300:] if r.stderr else "MKV failed"
                     if os.path.exists(out_mkv):
                         os.remove(out_mkv)
             except Exception as ex:
                 last_err = str(ex)
                 if os.path.exists(out_mkv):
-                    os.remove(out_mkv)
+                    try:
+                        os.remove(out_mkv)
+                    except Exception:
+                        pass
 
+            # Method 2: MP4 with mov_text subtitle
             if not success:
                 upd(40, "Trying MP4 soft sub...")
                 out_mp4 = unique_dest(dl_folder, safe + ".mp4")
                 try:
-                    cs = os.path.join(work_dir, "clean.srt")
-                    clean_srt(s_path, cs)
+                    cs_path = os.path.join(work_dir, "clean.srt")
+                    clean_srt(s_path, cs_path)
                     r = subprocess.run(
                         ["ffmpeg", "-y",
                          "-i", os.path.abspath(v_path),
-                         "-i", cs,
+                         "-i", cs_path,
                          "-map", "0:v", "-map", "0:a?", "-map", "1:0",
                          "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
                          "-metadata:s:s:0", "language=eng",
                          "-disposition:s:0", "default",
                          "-movflags", "+faststart",
                          os.path.abspath(out_mp4)],
-                        capture_output=True,
-                        text=True,
-                        timeout=86400
+                        capture_output=True, text=True, timeout=86400
                     )
                     if good(r, out_mp4):
                         out_file = out_mp4
                         success = True
-                        upd(90, "Done...")
+                        upd(90, "MP4 soft sub done!")
                     else:
-                        last_err = r.stderr[-300:] if r.stderr else "mp4 failed"
+                        last_err = r.stderr[-300:] if r.stderr else "MP4 soft sub failed"
                         if os.path.exists(out_mp4):
                             os.remove(out_mp4)
                 except Exception as ex:
                     last_err = str(ex)
 
             if not success:
-                raise RuntimeError("Soft-sub failed: " + last_err[:300])
+                raise RuntimeError(f"Soft-sub failed: {last_err[:300]}")
 
         size_bytes = os.path.getsize(out_file)
-        upd(100, "Done! " + format_file_size(size_bytes))
+        size_str = format_file_size(size_bytes)
+        upd(100, f"Done! {size_str}")
+
         return {
             "success": True,
             "path": out_file,
             "size_mb": round(size_bytes / 1024 / 1024, 1),
-            "size_str": format_file_size(size_bytes),
+            "size_str": size_str,
             "filename": os.path.basename(out_file),
         }
 
@@ -643,7 +707,7 @@ def process_episode(
                 os.remove(out_file)
             except Exception:
                 pass
-        upd(0, "Error: " + msg[:180])
+        upd(0, f"Error: {msg[:180]}")
         return {"success": False, "error": msg}
 
     finally:
@@ -671,13 +735,14 @@ def check_match(vname, sname):
     return "ok" if vn == sn else "mismatch"
 
 
+# ─── Header ───────────────────────────────────────────────────────────────────
 hw = check_hw_accel()
 ffmpeg_ok = check_ffmpeg()
 enc_name, _ = get_best_encoder()
 
 chips_html = "".join(
-    '<span class="hw-chip ' + ("hw-on" if v else "hw-off") + '">'
-    + ("⚡" if v else "○") + " " + k.upper() + "</span>"
+    f'<span class="hw-chip {"hw-on" if v else "hw-off"}">'
+    f'{"⚡" if v else "○"} {k.upper()}</span>'
     for k, v in hw.items()
 )
 
@@ -690,44 +755,39 @@ st.markdown(
     '<h1 style="font-size:24px;font-weight:800;margin:0 0 4px">'
     'Video &amp; Subtitle Merger</h1>'
     '<p style="color:rgba(255,255,255,.5);font-size:13px;margin:0 0 6px">'
-    'Merge individually or in batch &nbsp;&bull;&nbsp; Up to '
-    + str(MAX_EPISODES) +
-    ' episodes &nbsp;&bull;&nbsp; '
-    'Files up to <strong style="color:#6ee7b7">10 GB</strong></p>'
-    '<div style="margin-top:8px">' + chips_html + "</div>"
-    "</div>",
+    f'Merge individually or in batch &nbsp;&bull;&nbsp; Up to {MAX_EPISODES} episodes'
+    ' &nbsp;&bull;&nbsp; Files up to <strong style="color:#6ee7b7">10 GB</strong></p>'
+    f'<div style="margin-top:8px">{chips_html}</div>'
+    '</div>',
     unsafe_allow_html=True,
 )
 
 if not ffmpeg_ok:
     st.markdown(
-        '<div class="warn-box">'
-        "⚠️ FFmpeg not found! "
-        "Ensure packages.txt contains ffmpeg"
-        "</div>",
+        '<div class="warn-box">⚠️ FFmpeg not found! '
+        'Ensure packages.txt contains <code>ffmpeg</code></div>',
         unsafe_allow_html=True,
     )
 
 st.markdown(
     '<div class="how-box">'
-    "<strong>How this app works</strong><br>"
-    "1. Upload your video and subtitle files below<br>"
-    "2. Click Merge — the app processes files on the server<br>"
-    "3. Click the Download button that appears<br>"
+    '<strong>How this app works</strong><br>'
+    '1. Upload your video and subtitle files below<br>'
+    '2. Click Merge — the app processes files on the server<br>'
+    '3. Click the Download button that appears<br>'
     '<span style="color:rgba(167,243,208,.6);font-size:11px">'
-    "Files are processed on the server. "
-    "Download button sends the file to your computer."
-    "</span>"
-    "</div>",
+    'Files are processed on the server. '
+    'Download button sends the file to your computer.'
+    '</span>'
+    '</div>',
     unsafe_allow_html=True,
 )
 
+# ─── Mode selector ─────────────────────────────────────────────────────────────
 st.markdown(
-    '<div class="merger-card">'
-    '<div class="merger-title">Subtitle Mode</div>',
+    '<div class="merger-card"><div class="merger-title">Subtitle Mode</div>',
     unsafe_allow_html=True,
 )
-
 mode = st.radio(
     "Subtitle mode",
     options=["hard", "soft"],
@@ -739,69 +799,46 @@ mode = st.radio(
     label_visibility="collapsed",
     horizontal=True,
 )
-
 if mode == "hard":
     st.markdown(
-        '<div class="info-box">Encoder: <strong>'
-        + enc_name +
-        "</strong></div>",
+        f'<div class="info-box">Encoder: <strong>{enc_name}</strong></div>',
         unsafe_allow_html=True,
     )
 else:
     st.markdown(
-        '<div class="info-box">'
-        "Stream copy — even a 10 GB file finishes in seconds!"
-        "</div>",
+        '<div class="info-box">Stream copy — even a 10 GB file finishes in seconds!</div>',
         unsafe_allow_html=True,
     )
-
 st.markdown("</div>", unsafe_allow_html=True)
 
+# ─── Episode list ──────────────────────────────────────────────────────────────
 st.markdown('<div class="merger-card">', unsafe_allow_html=True)
 ep_count = len(st.session_state.eps)
 st.markdown(
-    '<div class="merger-title">Episodes '
-    '<span style="background:rgba(99,102,241,.2);color:#a5b4fc;'
-    'font-size:11px;padding:2px 10px;border-radius:20px;font-weight:700">'
-    + str(ep_count) + " / " + str(MAX_EPISODES) +
-    "</span></div>",
+    f'<div class="merger-title">Episodes '
+    f'<span style="background:rgba(99,102,241,.2);color:#a5b4fc;'
+    f'font-size:11px;padding:2px 10px;border-radius:20px;font-weight:700">'
+    f'{ep_count} / {MAX_EPISODES}</span></div>',
     unsafe_allow_html=True,
 )
 
 tb1, tb2, tb3, tb4, tb5 = st.columns([2, 1, 2, 2, 2])
 with tb1:
-    if st.button(
-        "+ Add Episode",
-        use_container_width=True,
-        disabled=ep_count >= MAX_EPISODES
-    ):
-        st.session_state.eps.append({
-            "name": "", "video": None, "srt": None, "job": None
-        })
+    if st.button("+ Add Episode", use_container_width=True, disabled=ep_count >= MAX_EPISODES):
+        st.session_state.eps.append({"name": "", "job": None})
         st.rerun()
 
 with tb2:
-    n_bulk = st.number_input(
-        "N",
-        min_value=1,
-        max_value=MAX_EPISODES,
-        value=5,
-        label_visibility="collapsed"
-    )
-
+    n_bulk = st.number_input("N", min_value=1, max_value=MAX_EPISODES, value=5,
+                              label_visibility="collapsed")
 with tb3:
-    if st.button(
-        "Add " + str(int(n_bulk)) + " Episodes",
-        use_container_width=True,
-        disabled=ep_count >= MAX_EPISODES
-    ):
+    if st.button(f"Add {int(n_bulk)} Episodes", use_container_width=True,
+                 disabled=ep_count >= MAX_EPISODES):
         to_add = min(int(n_bulk), MAX_EPISODES - ep_count)
         start = ep_count + 1
         for k in range(to_add):
             st.session_state.eps.append({
                 "name": "EP" + str(start + k).zfill(2),
-                "video": None,
-                "srt": None,
                 "job": None,
             })
         st.rerun()
@@ -822,6 +859,10 @@ with tb4:
 with tb5:
     if st.button("Clear All", use_container_width=True, disabled=ep_count == 0):
         st.session_state.eps = []
+        st.session_state.ep_video_bytes = {}
+        st.session_state.ep_video_names = {}
+        st.session_state.ep_srt_bytes = {}
+        st.session_state.ep_srt_names = {}
         st.rerun()
 
 st.divider()
@@ -839,214 +880,234 @@ for i in range(len(st.session_state.eps)):
     is_err = status == "error"
     is_running = status == "processing"
 
-    with st.container():
-        if is_done:
-            card_cls = " ep-done"
-        elif is_err:
-            card_cls = " ep-error"
-        elif is_running:
-            card_cls = " ep-running"
-        else:
-            card_cls = ""
+    if is_done:
+        card_cls = " ep-done"
+    elif is_err:
+        card_cls = " ep-error"
+    elif is_running:
+        card_cls = " ep-running"
+    else:
+        card_cls = ""
 
-        st.markdown(
-            '<div class="ep-card' + card_cls + '">',
-            unsafe_allow_html=True
+    st.markdown(f'<div class="ep-card{card_cls}">', unsafe_allow_html=True)
+
+    h1, h2, h3, h4 = st.columns([4, 1, 1, 1])
+    with h1:
+        new_name = st.text_input(
+            f"Name {i + 1}",
+            value=ep.get("name", "") or f"EP{str(i + 1).zfill(2)}",
+            key=f"epname_{i}",
+            label_visibility="collapsed",
+            placeholder=f"EP{str(i + 1).zfill(2)}",
         )
+        st.session_state.eps[i]["name"] = new_name
 
-        h1, h2, h3, h4 = st.columns([4, 1, 1, 1])
-        with h1:
-            new_name = st.text_input(
-                "Name " + str(i + 1),
-                value=ep.get("name", "") or ("EP" + str(i + 1).zfill(2)),
-                key="epname_" + str(i),
-                label_visibility="collapsed",
-                placeholder="EP" + str(i + 1).zfill(2),
+    with h2:
+        if st.button("Up", key=f"up_{i}", disabled=(i == 0)):
+            # Also swap stored bytes
+            for d in [st.session_state.ep_video_bytes,
+                      st.session_state.ep_video_names,
+                      st.session_state.ep_srt_bytes,
+                      st.session_state.ep_srt_names]:
+                d[i], d[i - 1] = d.get(i - 1), d.get(i)
+            st.session_state.eps[i], st.session_state.eps[i - 1] = (
+                st.session_state.eps[i - 1], st.session_state.eps[i]
             )
-            st.session_state.eps[i]["name"] = new_name
+            st.rerun()
 
-        with h2:
-            if st.button("Up", key="up_" + str(i), disabled=(i == 0)):
-                tmp = st.session_state.eps[i - 1]
-                st.session_state.eps[i - 1] = st.session_state.eps[i]
-                st.session_state.eps[i] = tmp
-                st.rerun()
-
-        with h3:
-            last_idx = len(st.session_state.eps) - 1
-            if st.button("Dn", key="dn_" + str(i), disabled=(i == last_idx)):
-                tmp = st.session_state.eps[i + 1]
-                st.session_state.eps[i + 1] = st.session_state.eps[i]
-                st.session_state.eps[i] = tmp
-                st.rerun()
-
-        with h4:
-            if st.button("X", key="del_" + str(i)):
-                eps_to_delete.append(i)
-
-        f1, f2 = st.columns(2)
-
-        with f1:
-            vfile = st.file_uploader(
-                "Video (up to 10 GB)",
-                type=["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"],
-                key="vup_" + str(i),
+    with h3:
+        last_idx = len(st.session_state.eps) - 1
+        if st.button("Dn", key=f"dn_{i}", disabled=(i == last_idx)):
+            for d in [st.session_state.ep_video_bytes,
+                      st.session_state.ep_video_names,
+                      st.session_state.ep_srt_bytes,
+                      st.session_state.ep_srt_names]:
+                d[i], d[i + 1] = d.get(i + 1), d.get(i)
+            st.session_state.eps[i], st.session_state.eps[i + 1] = (
+                st.session_state.eps[i + 1], st.session_state.eps[i]
             )
-            if vfile is not None:
-                st.session_state.eps[i]["video"] = vfile
-                if status in ("completed", "error"):
-                    st.session_state.eps[i]["job"] = None
-                try:
-                    sz = get_uploaded_file_size(vfile)
-                    if sz > 0:
-                        st.markdown(
-                            '<div class="upload-info">'
-                            + vfile.name
-                            + " — "
-                            + format_file_size(sz)
-                            + "</div>",
-                            unsafe_allow_html=True,
-                        )
-                except Exception:
-                    pass
+            st.rerun()
 
-        with f2:
-            sfile = st.file_uploader(
-                "Subtitle (.srt / .ass)",
-                type=["srt", "ass", "ssa", "vtt", "sub"],
-                key="sup_" + str(i),
-            )
-            if sfile is not None:
-                st.session_state.eps[i]["srt"] = sfile
-                if status in ("completed", "error"):
-                    st.session_state.eps[i]["job"] = None
+    with h4:
+        if st.button("X", key=f"del_{i}"):
+            eps_to_delete.append(i)
 
-        v_up = st.session_state.eps[i].get("video")
-        s_up = st.session_state.eps[i].get("srt")
+    f1, f2 = st.columns(2)
 
-        if v_up and s_up:
-            try:
-                match = check_match(v_up.name, s_up.name)
-                if match == "mismatch":
-                    vn = extract_number(v_up.name)
-                    sn = extract_number(s_up.name)
-                    st.markdown(
-                        '<div class="mismatch-box">'
-                        "Number mismatch: Video #"
-                        + str(vn)
-                        + " vs Subtitle #"
-                        + str(sn)
-                        + "<br>"
-                        + v_up.name
-                        + " vs "
-                        + s_up.name
-                        + "</div>",
-                        unsafe_allow_html=True,
-                    )
-                elif match == "ok":
-                    vn = extract_number(v_up.name)
-                    st.markdown(
-                        '<span class="badge-ok">#' + str(vn) + " matched</span>",
-                        unsafe_allow_html=True,
-                    )
-            except Exception:
-                pass
-
-        job = safe_get_job(st.session_state.eps[i])
-        status = job.get("status", "")
-
-        if status == "completed":
-            out_path = job.get("path", "")
-            size_str = job.get("size_str", str(job.get("size_mb", "?")) + " MB")
-            st.success("Processing complete — " + size_str)
-            if out_path and os.path.isfile(out_path):
-                fname = os.path.basename(out_path)
-                file_size = os.path.getsize(out_path)
+    with f1:
+        vfile = st.file_uploader(
+            "Video (up to 10 GB)",
+            type=["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"],
+            key=f"vup_{i}",
+        )
+        if vfile is not None:
+            # Read and store bytes immediately
+            vfile.seek(0)
+            v_bytes = vfile.read()
+            st.session_state.ep_video_bytes[i] = v_bytes
+            st.session_state.ep_video_names[i] = vfile.name
+            # Reset job if new file uploaded
+            if status in ("completed", "error"):
+                st.session_state.eps[i]["job"] = None
+            sz = len(v_bytes)
+            if sz > 0:
                 st.markdown(
-                    '<div class="dl-box">'
-                    "Your file is ready! Click the button below to download."
-                    "</div>",
+                    f'<div class="upload-info">{vfile.name} — {format_file_size(sz)}</div>',
                     unsafe_allow_html=True,
                 )
-                try:
-                    with open(out_path, "rb") as fh:
-                        st.download_button(
-                            label="Download " + fname + " (" + format_file_size(file_size) + ")",
-                            data=fh,
-                            file_name=fname,
-                            mime="video/mp4",
-                            key="dl_" + str(i) + "_" + uuid.uuid4().hex[:6],
-                            use_container_width=True,
-                        )
-                except Exception as ex:
-                    st.warning("Could not prepare download: " + str(ex))
 
-        elif status == "error":
-            err_msg = str(job.get("msg", "Failed"))
-            st.error("Error: " + err_msg)
+        # Show stored file info even if uploader is empty this run
+        elif i in st.session_state.ep_video_bytes:
+            sz = len(st.session_state.ep_video_bytes[i])
+            vname = st.session_state.ep_video_names.get(i, "video")
+            st.markdown(
+                f'<div class="upload-info">✓ {vname} — {format_file_size(sz)}</div>',
+                unsafe_allow_html=True,
+            )
 
-        elif status == "processing":
-            pct_val = job.get("pct", 0)
-            msg_val = str(job.get("msg", "Processing..."))
-            st.progress(pct_val / 100, text=msg_val)
+    with f2:
+        sfile = st.file_uploader(
+            "Subtitle (.srt / .ass)",
+            type=["srt", "ass", "ssa", "vtt", "sub"],
+            key=f"sup_{i}",
+        )
+        if sfile is not None:
+            sfile.seek(0)
+            s_bytes = sfile.read()
+            st.session_state.ep_srt_bytes[i] = s_bytes
+            st.session_state.ep_srt_names[i] = sfile.name
+            if status in ("completed", "error"):
+                st.session_state.eps[i]["job"] = None
 
-        can_merge = bool(v_up and s_up and not is_running)
+        elif i in st.session_state.ep_srt_bytes:
+            sz = len(st.session_state.ep_srt_bytes[i])
+            sname = st.session_state.ep_srt_names.get(i, "subtitle")
+            st.markdown(
+                f'<div class="upload-info">✓ {sname} — {format_file_size(sz)}</div>',
+                unsafe_allow_html=True,
+            )
 
-        if is_err:
-            btn_lbl = "Retry"
-        elif is_done:
-            btn_lbl = "Re-merge"
+    # Check if we have data (from this run or stored)
+    has_video = i in st.session_state.ep_video_bytes and st.session_state.ep_video_bytes[i]
+    has_srt = i in st.session_state.ep_srt_bytes and st.session_state.ep_srt_bytes[i]
+    v_name_stored = st.session_state.ep_video_names.get(i, "")
+    s_name_stored = st.session_state.ep_srt_names.get(i, "")
+
+    # Number match check
+    if has_video and has_srt and v_name_stored and s_name_stored:
+        try:
+            match = check_match(v_name_stored, s_name_stored)
+            if match == "mismatch":
+                vn = extract_number(v_name_stored)
+                sn = extract_number(s_name_stored)
+                st.markdown(
+                    f'<div class="mismatch-box">'
+                    f'Number mismatch: Video #{vn} vs Subtitle #{sn}<br>'
+                    f'{v_name_stored} vs {s_name_stored}</div>',
+                    unsafe_allow_html=True,
+                )
+            elif match == "ok":
+                vn = extract_number(v_name_stored)
+                st.markdown(
+                    f'<span class="badge-ok">#{vn} matched</span>',
+                    unsafe_allow_html=True,
+                )
+        except Exception:
+            pass
+
+    # Job status display
+    job = safe_get_job(st.session_state.eps[i])
+    status = job.get("status", "")
+
+    if status == "completed":
+        out_path = job.get("path", "")
+        size_str = job.get("size_str", str(job.get("size_mb", "?")) + " MB")
+        st.success(f"Processing complete — {size_str}")
+        if out_path and os.path.isfile(out_path):
+            fname = os.path.basename(out_path)
+            file_size = os.path.getsize(out_path)
+            st.markdown(
+                '<div class="dl-box">Your file is ready! Click the button below to download.</div>',
+                unsafe_allow_html=True,
+            )
+            try:
+                with open(out_path, "rb") as fh:
+                    st.download_button(
+                        label=f"⬇ Download {fname} ({format_file_size(file_size)})",
+                        data=fh,
+                        file_name=fname,
+                        mime="video/mp4",
+                        key=f"dl_{i}_{uuid.uuid4().hex[:6]}",
+                        use_container_width=True,
+                    )
+            except Exception as ex:
+                st.warning(f"Could not prepare download: {ex}")
+
+    elif status == "error":
+        err_msg = str(job.get("msg", "Failed"))
+        st.error(f"❌ Error: {err_msg}")
+        # Show full error in expander for debugging
+        with st.expander("Show error details"):
+            st.code(err_msg)
+
+    elif status == "processing":
+        pct_val = job.get("pct", 0)
+        msg_val = str(job.get("msg", "Processing..."))
+        st.progress(pct_val / 100, text=msg_val)
+
+    # Merge button
+    can_merge = bool(has_video and has_srt and not is_running)
+
+    if is_err:
+        btn_lbl = "🔄 Retry"
+    elif is_done:
+        btn_lbl = "🔄 Re-merge"
+    else:
+        btn_lbl = "▶ Merge This Episode"
+
+    if st.button(btn_lbl, key=f"merge_ep_{i}", disabled=not can_merge, use_container_width=True):
+        ep_name = st.session_state.eps[i].get("name") or f"Episode_{i + 1}"
+        v_bytes = st.session_state.ep_video_bytes.get(i)
+        s_bytes = st.session_state.ep_srt_bytes.get(i)
+        v_name = st.session_state.ep_video_names.get(i, "video.mp4")
+        s_name = st.session_state.ep_srt_names.get(i, "subtitle.srt")
+
+        if not v_bytes or not s_bytes:
+            st.error("Missing video or subtitle data. Please re-upload files.")
         else:
-            btn_lbl = "Merge This Episode"
-
-        if st.button(
-            btn_lbl,
-            key="merge_ep_" + str(i),
-            disabled=not can_merge,
-            use_container_width=True,
-        ):
-            v_obj = st.session_state.eps[i]["video"]
-            s_obj = st.session_state.eps[i]["srt"]
-            v_name = v_obj.name
-            s_name = s_obj.name
-            ep_name = st.session_state.eps[i].get("name") or ("Episode_" + str(i + 1))
-
             proceed = True
             if check_match(v_name, s_name) == "mismatch":
                 proceed = st.checkbox(
-                    "Mismatch detected — tick to proceed anyway",
-                    key="mismatch_ok_" + str(i),
+                    "⚠️ Number mismatch detected — tick to proceed anyway",
+                    key=f"mismatch_ok_{i}",
                 )
 
             if proceed:
                 st.session_state.eps[i]["job"] = {
                     "status": "processing",
                     "pct": 1,
-                    "msg": "Writing file to disk...",
+                    "msg": "Starting...",
                     "path": None,
                 }
 
-                prog = st.progress(0, text="Starting...")
+                prog_bar = st.progress(0, text="Initializing...")
 
-                def cb(pct, msg, _p=prog):
-                    try:
-                        _p.progress(min(pct, 100) / 100, text=msg[:120])
-                    except Exception:
-                        pass
-
-                try:
-                    v_obj.seek(0)
-                    s_obj.seek(0)
-                except Exception:
-                    pass
+                def make_cb(pb):
+                    def cb(pct, msg):
+                        try:
+                            pb.progress(min(int(pct), 100) / 100, text=str(msg)[:120])
+                        except Exception:
+                            pass
+                    return cb
 
                 work_out = "/tmp/merged_videos"
                 os.makedirs(work_out, exist_ok=True)
 
-                result = process_episode(
-                    v_obj, v_name, s_obj, s_name,
+                result = process_episode_from_bytes(
+                    v_bytes, v_name,
+                    s_bytes, s_name,
                     ep_name, mode, work_out,
-                    progress_cb=cb,
+                    progress_cb=make_cb(prog_bar),
                 )
 
                 if result["success"]:
@@ -1068,128 +1129,116 @@ for i in range(len(st.session_state.eps)):
                 }
                 st.rerun()
 
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
+# Handle deletions
 if eps_to_delete:
     for idx in sorted(eps_to_delete, reverse=True):
         if 0 <= idx < len(st.session_state.eps):
             st.session_state.eps.pop(idx)
+            # Clean up stored bytes
+            for d in [st.session_state.ep_video_bytes,
+                      st.session_state.ep_video_names,
+                      st.session_state.ep_srt_bytes,
+                      st.session_state.ep_srt_names]:
+                d.pop(idx, None)
     st.rerun()
 
 if not st.session_state.eps:
     st.markdown(
         '<div style="text-align:center;padding:28px;'
         'color:rgba(255,255,255,.25);font-size:13px">'
-        "Click + Add Episode to get started"
-        "</div>",
+        'Click + Add Episode to get started'
+        '</div>',
         unsafe_allow_html=True,
     )
 
 st.markdown("</div>", unsafe_allow_html=True)
 
+# ─── Batch merge ───────────────────────────────────────────────────────────────
 st.markdown('<div class="merger-card">', unsafe_allow_html=True)
 st.markdown(
-    '<div class="batch-divider">batch merge all at once</div>',
+    '<div class="batch-divider">─── batch merge all at once ───</div>',
     unsafe_allow_html=True,
 )
 
 valid_eps = [
-    (i, ep)
-    for i, ep in enumerate(st.session_state.eps)
-    if ep is not None
-    and isinstance(ep, dict)
-    and ep.get("video")
-    and ep.get("srt")
+    i for i in range(len(st.session_state.eps))
+    if st.session_state.ep_video_bytes.get(i)
+    and st.session_state.ep_srt_bytes.get(i)
 ]
 n_valid = len(valid_eps)
+batch_label = f"▶▶ Merge All {n_valid} Episode{'s' if n_valid != 1 else ''}" if n_valid > 0 else "Merge All Episodes"
 
-if n_valid > 0:
-    batch_label = "Merge All " + str(n_valid) + " Episode" + ("s" if n_valid != 1 else "")
-else:
-    batch_label = "Merge All Episodes"
-
-if st.button(
-    batch_label,
-    disabled=n_valid == 0,
-    use_container_width=True,
-    type="primary",
-):
+if st.button(batch_label, disabled=n_valid == 0, use_container_width=True, type="primary"):
     work_out = "/tmp/merged_videos"
     os.makedirs(work_out, exist_ok=True)
     overall = st.progress(0, text="Starting batch...")
     ok_cnt = 0
     fail_cnt = 0
 
-    for step, (i, ep) in enumerate(valid_eps):
+    for step, i in enumerate(valid_eps):
+        ep = st.session_state.eps[i]
         overall.progress(
             step / n_valid,
-            text="Episode " + str(step + 1) + " of " + str(n_valid) + "...",
+            text=f"Episode {step + 1} of {n_valid}...",
         )
-        ep_name = ep.get("name") or ("Episode_" + str(i + 1))
-        v_obj = ep["video"]
-        s_obj = ep["srt"]
-
-        try:
-            v_obj.seek(0)
-            s_obj.seek(0)
-        except Exception:
-            pass
+        ep_name = ep.get("name") or f"Episode_{i + 1}"
+        v_bytes = st.session_state.ep_video_bytes.get(i)
+        s_bytes = st.session_state.ep_srt_bytes.get(i)
+        v_name = st.session_state.ep_video_names.get(i, "video.mp4")
+        s_name = st.session_state.ep_srt_names.get(i, "subtitle.srt")
 
         holder = st.empty()
 
-        def cb(pct, msg, h=holder, name=ep_name):
-            try:
-                h.progress(min(pct, 100) / 100, text=name + ": " + msg)
-            except Exception:
-                pass
+        def make_batch_cb(h, name):
+            def cb(pct, msg):
+                try:
+                    h.progress(min(int(pct), 100) / 100, text=f"{name}: {msg}")
+                except Exception:
+                    pass
+            return cb
 
-        result = process_episode(
-            v_obj, v_obj.name, s_obj, s_obj.name,
+        result = process_episode_from_bytes(
+            v_bytes, v_name,
+            s_bytes, s_name,
             ep_name, mode, work_out,
-            progress_cb=cb,
+            progress_cb=make_batch_cb(holder, ep_name),
         )
 
         if result["success"]:
-            new_status = "completed"
-            new_pct = 100
-            new_msg = result.get("size_str", "Done")
             ok_cnt += 1
-            holder.success(ep_name + " — " + result.get("size_str", ""))
+            holder.success(f"✓ {ep_name} — {result.get('size_str', '')}")
+            new_status = "completed"
+            new_msg = result.get("size_str", "Done")
         else:
-            new_status = "error"
-            new_pct = 0
-            new_msg = result.get("error", "Failed")
             fail_cnt += 1
-            holder.error(ep_name + " — " + result.get("error", "Failed"))
+            holder.error(f"✗ {ep_name} — {result.get('error', 'Failed')}")
+            new_status = "error"
+            new_msg = result.get("error", "Failed")
 
         st.session_state.eps[i]["job"] = {
             "status": new_status,
-            "pct": new_pct,
+            "pct": 100 if result["success"] else 0,
             "msg": new_msg,
             "path": result.get("path", ""),
             "size_mb": result.get("size_mb", 0),
             "size_str": result.get("size_str", ""),
         }
 
-    overall.progress(
-        1.0,
-        text="Done — " + str(ok_cnt) + " succeeded, " + str(fail_cnt) + " failed",
-    )
+    overall.progress(1.0, text=f"Done — {ok_cnt} succeeded, {fail_cnt} failed")
     st.markdown(
-        '<div class="sum-box">'
-        "Batch complete: "
-        + str(ok_cnt) + " completed, "
-        + str(fail_cnt) + " failed"
-        "</div>",
+        f'<div class="sum-box">Batch complete: {ok_cnt} completed, {fail_cnt} failed</div>',
         unsafe_allow_html=True,
     )
     st.rerun()
 
 st.markdown("</div>", unsafe_allow_html=True)
 
+# ─── Download all completed ────────────────────────────────────────────────────
 done_eps = []
 for ep in st.session_state.eps:
-    if ep is None or not isinstance(ep, dict):
+    if not isinstance(ep, dict):
         continue
     job = ep.get("job")
     if not isinstance(job, dict):
@@ -1197,20 +1246,13 @@ for ep in st.session_state.eps:
     if job.get("status") != "completed":
         continue
     path = job.get("path", "")
-    if not path or not os.path.isfile(str(path)):
-        continue
-    done_eps.append(ep)
+    if path and os.path.isfile(str(path)):
+        done_eps.append(ep)
 
 if done_eps:
     st.markdown(
         '<div class="merger-card">'
-        '<div class="merger-title">Download All Completed Files</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<div style="color:rgba(255,255,255,.45);font-size:12px;margin-bottom:12px">'
-        "Click each button to download the merged file."
-        "</div>",
+        '<div class="merger-title">⬇ Download All Completed Files</div>',
         unsafe_allow_html=True,
     )
     for ep in done_eps:
@@ -1220,17 +1262,15 @@ if done_eps:
         try:
             file_size = os.path.getsize(path)
             ep_name = ep.get("name") or fname
-            label = ep_name + " — " + format_file_size(file_size)
             with open(path, "rb") as fh:
                 st.download_button(
-                    label=label,
+                    label=f"⬇ {ep_name} — {format_file_size(file_size)}",
                     data=fh,
                     file_name=fname,
                     mime="video/mp4",
-                    key="dlall_" + fname + "_" + uuid.uuid4().hex[:6],
+                    key=f"dlall_{fname}_{uuid.uuid4().hex[:6]}",
                     use_container_width=True,
                 )
         except Exception as ex:
-            st.warning("Could not prepare " + fname + ": " + str(ex))
-
+            st.warning(f"Could not prepare {fname}: {ex}")
     st.markdown("</div>", unsafe_allow_html=True)
